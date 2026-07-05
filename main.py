@@ -1,3 +1,4 @@
+# main.py
 import asyncio
 import json
 import os
@@ -112,7 +113,7 @@ SESSION_TTL = 60 * 60 * 24 * 7
 def hash_password(pw: str) -> str:
     return hashlib.sha256(f"{pw}{CONFIG['secret']}".encode()).hexdigest()
 
-AUTH = {"password_hash": hash_password(os.environ.get("ADMIN_PASSWORD", "123456"))}
+AUTH = {"password_hash": hash_password(os.environ.get("ADMIN_PASSWORD", "@ansooyefilter"))}
 SESSIONS: dict = {}
 SESSIONS_LOCK = asyncio.Lock()
 
@@ -290,20 +291,43 @@ async def root():
 async def health():
     return {"status": "ok", "connections": len(connections), "uptime": uptime()}
 
-# ── Subscription (single link) ────────────────────────────────────────────────
+# ── Subscription (single link) – با صفحه‌ی HTML برای مرورگر ─────────────────
 @app.get("/sub/{uuid}")
-async def subscription_single(uuid: str):
+async def subscription_single(uuid: str, request: Request):
     import base64
     async with LINKS_LOCK:
         link = LINKS.get(uuid)
     if not link or not is_link_allowed(link):
         raise HTTPException(status_code=404, detail="not found or inactive")
+
     host = get_host()
     proto = link.get("protocol", DEFAULT_PROTOCOL)
     vless = generate_vless_link(uuid, host, remark=f"AnsooyeFilter-{link['label']}", protocol=proto)
+    sub_url = f"https://{host}/sub/{uuid}"
+
+    accept = request.headers.get("accept", "")
+    if "text/html" in accept:
+        from pages import get_single_link_page_html
+        link_data = {
+            "uuid": uuid,
+            **link,
+            "expired": is_link_expired(link),
+            "vless_link": vless,
+            "sub_url": sub_url,
+            "used_fmt": fmt_bytes(link.get("used_bytes", 0)),
+            "limit_fmt": "∞" if link.get("limit_bytes", 0) == 0 else fmt_bytes(link["limit_bytes"]),
+        }
+        return HTMLResponse(content=get_single_link_page_html(uuid, link_data))
+
     content = base64.b64encode(vless.encode()).decode()
-    return Response(content=content, media_type="text/plain",
-                    headers={"profile-title": quote(link["label"]), "support-url": "https://t.me/AnsooyeFilter"})
+    return Response(
+        content=content,
+        media_type="text/plain",
+        headers={
+            "profile-title": quote(link["label"]),
+            "support-url": "https://t.me/AnsooyeFilter",
+        }
+    )
 
 @app.get("/sub-all")
 async def subscription_all(_=Depends(require_auth)):
@@ -432,7 +456,6 @@ async def assign_link_to_sub(sub_id: str, request: Request, _=Depends(require_au
     asyncio.create_task(save_state())
     return {"ok": True}
 
-# ── Public sub-group subscription file ───────────────────────────────────────
 @app.get("/sub-group/{uuid_key}")
 async def sub_group_subscription(uuid_key: str, request: Request):
     import base64
@@ -440,12 +463,10 @@ async def sub_group_subscription(uuid_key: str, request: Request):
         sub = next((s for s in SUBS.values() if s.get("uuid_key") == uuid_key), None)
     if not sub:
         raise HTTPException(status_code=404, detail="not found")
-
     if sub.get("password_hash"):
         pw = request.query_params.get("pw", "")
         if hash_password(pw) != sub["password_hash"]:
             raise HTTPException(status_code=403, detail="wrong password")
-
     host = get_host()
     link_ids = sub.get("link_ids", [])
     async with LINKS_LOCK:
@@ -454,7 +475,6 @@ async def sub_group_subscription(uuid_key: str, request: Request):
             link = LINKS.get(lid)
             if link and is_link_allowed(link):
                 lines.append(generate_vless_link(lid, host, remark=f"AnsooyeFilter-{link['label']}", protocol=link.get("protocol", DEFAULT_PROTOCOL)))
-
     content = base64.b64encode("\n".join(lines).encode()).decode()
     return Response(
         content=content,
@@ -532,12 +552,11 @@ async def get_stats(_=Depends(require_auth)):
 async def get_activity(_=Depends(require_auth)):
     return {"logs": list(activity_logs)[-150:]}
 
-# ── Live connections (with IP) ────────────────────────────────────────────────
+# ── Live connections ─────────────────────────────────────────────────────────
 @app.get("/api/connections")
 async def get_connections(_=Depends(require_auth)):
     async with LINKS_LOCK:
         snap = dict(LINKS)
-
     grouped: dict[str, dict] = {}
     for conn_id, c in connections.items():
         ip = c.get("ip", "نامشخص")
@@ -565,7 +584,6 @@ async def get_connections(_=Depends(require_auth)):
                 g["first_connected_at"] = ca
             if not g["last_connected_at"] or ca > g["last_connected_at"]:
                 g["last_connected_at"] = ca
-
     result = []
     for ip, g in grouped.items():
         result.append({
@@ -580,7 +598,6 @@ async def get_connections(_=Depends(require_auth)):
             "last_connected_at": g["last_connected_at"],
         })
     result.sort(key=lambda x: x.get("last_connected_at") or "", reverse=True)
-
     return {
         "connections": result,
         "count": len(result),
@@ -719,9 +736,7 @@ async def delete_link(uid: str, _=Depends(require_auth)):
     log_activity("link", f"کانفیگ «{label}» حذف شد", "err")
     return {"ok": True, "deleted": uid}
 
-# ══════════════════════════════════════════════════════════════════════════════
-# VLESS Relay (separated)
-# ══════════════════════════════════════════════════════════════════════════════
+# ── VLESS Relay ──────────────────────────────────────────────────────────────
 from relay_vless import (
     RELAY_BUF,
     parse_vless_header,
@@ -733,9 +748,7 @@ from relay_vless import (
 
 app.add_api_websocket_route("/ws/{uuid}", websocket_tunnel)
 
-# ══════════════════════════════════════════════════════════════════════════════
-# XHTTP Transport
-# ══════════════════════════════════════════════════════════════════════════════
+# ── XHTTP Transport ───────────────────────────────────────────────────────────
 from xhttp_siz10 import router as xhttp_router
 app.include_router(xhttp_router)
 
@@ -778,18 +791,15 @@ async def public_sub_data(uuid_key: str, request: Request):
     if not sub_entry:
         raise HTTPException(status_code=404, detail="not found")
     sub_id, sub = sub_entry
-
     has_pw = sub.get("password_hash") is not None
     if has_pw:
         pw = request.query_params.get("pw", "")
         if hash_password(pw) != sub["password_hash"]:
             return JSONResponse({"locked": True, "name": sub["name"]})
-
     host = get_host()
     link_ids = sub.get("link_ids", [])
     async with LINKS_LOCK:
         snap = dict(LINKS)
-
     links_out = []
     active_conns = 0
     for lid in link_ids:
@@ -814,7 +824,6 @@ async def public_sub_data(uuid_key: str, request: Request):
             "sub_url": f"https://{host}/sub/{lid}",
             "connections": conn_count,
         })
-
     total_used = sum(l["used_bytes"] for l in links_out)
     return {
         "locked": False,
@@ -826,16 +835,16 @@ async def public_sub_data(uuid_key: str, request: Request):
         "links": links_out,
     }
 
-# ── HTML Pages (login + dashboard) ───────────────────────────────────────────
+# ── HTML Pages ───────────────────────────────────────────────────────────────
 from pages import LOGIN_HTML, DASHBOARD_HTML
 
 @app.get("/login", response_class=HTMLResponse)
 async def login_page(request: Request):
     if await is_valid_session(request.cookies.get(SESSION_COOKIE)):
-        return RedirectResponse(url="/dashboard")
+        return RedirectResponse(url="/panel")
     return HTMLResponse(content=LOGIN_HTML)
 
-@app.get("/dashboard", response_class=HTMLResponse)
+@app.get("/panel", response_class=HTMLResponse)
 async def dashboard(request: Request):
     if not await is_valid_session(request.cookies.get(SESSION_COOKIE)):
         return RedirectResponse(url="/login")
@@ -844,7 +853,7 @@ async def dashboard(request: Request):
 
 @app.get("/test-ws", response_class=HTMLResponse)
 async def test_ws_redirect():
-    return HTMLResponse(content="<script>location.href='/dashboard'</script>")
+    return HTMLResponse(content="<script>location.href='/panel'</script>")
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=CONFIG["port"], log_level="info", workers=1)
